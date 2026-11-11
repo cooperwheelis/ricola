@@ -1,8 +1,8 @@
 """Screenshot a multiple-choice question and show the answer number.
 
 On Windows, press F8 to turn capture on, and F8 again to turn it off.
-On macOS, press Control-Option-S. The F8 key is play/pause there, so the
-script never receives it.
+On macOS, press the backslash key. F8 is play/pause there, so the script
+never receives it.
 While capture is on, right-click solves the question on that screen.
 The choice number (1, 2, 3, 4, counting from the top) appears as small
 black text at the top center of that monitor.
@@ -59,7 +59,15 @@ import mss
 import tkinter as tk
 from anthropic import Anthropic
 from PIL import Image
-from pynput import keyboard, mouse
+
+try:
+    from pynput import keyboard, mouse
+except (ImportError, OSError) as exc:
+    print("The keyboard library will not load.")
+    print(exc)
+    print("From the ricola folder, run:")
+    print("  .venv/bin/python -m pip install -r requirements.txt")
+    sys.exit(1)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MODEL_DEFAULT = "claude-sonnet-5-5"
@@ -67,18 +75,8 @@ EFFORT_DEFAULT = "high"
 OVERLAY_FONT = ("Helvetica", 8, "normal") if sys.platform == "darwin" else ("Segoe UI", 8, "normal")
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
-# Hardware keycode for the S key on Apple keyboards. Control-Option-S is used
-# because F8 is the play/pause media key and never arrives as F8.
-MAC_S_KEYCODE = 1
-MODIFIER_KEYS = {
-    keyboard.Key.ctrl: "ctrl",
-    keyboard.Key.ctrl_l: "ctrl",
-    keyboard.Key.ctrl_r: "ctrl",
-    keyboard.Key.alt: "alt",
-    keyboard.Key.alt_l: "alt",
-    keyboard.Key.alt_r: "alt",
-    keyboard.Key.alt_gr: "alt",
-}
+# Apple ANSI keycode for the key that types a backslash.
+MAC_BACKSLASH_KEYCODE = 42
 
 SYSTEM_PROMPT = """You answer the multiple-choice question in the main page of a screenshot.
 
@@ -142,6 +140,12 @@ def to_jpeg_b64(image: Image.Image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=85)
     return base64.standard_b64encode(buffer.getvalue()).decode("ascii")
+
+
+def is_backslash(key) -> bool:
+    if getattr(key, "char", None) == "\\":
+        return True
+    return sys.platform == "darwin" and getattr(key, "vk", None) == MAC_BACKSLASH_KEYCODE
 
 
 def claude_key() -> str:
@@ -289,7 +293,6 @@ class Ricola:
         self.label.pack()
         configure_overlay(self.root, self.label)
         self.clickthrough_ready = False
-        self._held: set[str] = set()
         self._toggle_down = False
         self._right_down = None
         self._right_up = None
@@ -312,11 +315,7 @@ class Ricola:
         self.mouse_listener.start()
 
     def on_press(self, key) -> None:
-        modifier = MODIFIER_KEYS.get(key)
-        if modifier:
-            self._held.add(modifier)
-            return
-        if key == keyboard.Key.f8 or self.mac_toggle(key):
+        if key == keyboard.Key.f8 or is_backslash(key):
             if not self._toggle_down:
                 self._toggle_down = True
                 self.ui.put(("toggle", None))
@@ -325,21 +324,8 @@ class Ricola:
             self.ui.put(("hide", None))
 
     def on_release(self, key) -> None:
-        modifier = MODIFIER_KEYS.get(key)
-        if modifier:
-            self._held.discard(modifier)
-            return
-        if key == keyboard.Key.f8 or getattr(key, "vk", None) == MAC_S_KEYCODE:
+        if key == keyboard.Key.f8 or is_backslash(key):
             self._toggle_down = False
-
-    def mac_toggle(self, key) -> bool:
-        if sys.platform != "darwin":
-            return False
-        if "ctrl" not in self._held or "alt" not in self._held:
-            return False
-        if getattr(key, "vk", None) == MAC_S_KEYCODE:
-            return True
-        return getattr(key, "char", None) in ("s", "S")
 
     def filter_mouse(self, msg, data):
         if not self.armed.is_set() or msg not in (WM_RBUTTONDOWN, WM_RBUTTONUP):
@@ -585,8 +571,8 @@ def main() -> None:
         return
     set_console_title("ricola")
     if sys.platform == "darwin":
-        print("Running. Press Control-Option-S to turn capture on.", flush=True)
-        print("Press it again to turn capture off. This window stays open.", flush=True)
+        print("Running. Press \\ to turn capture on.", flush=True)
+        print("Press \\ again to turn capture off. This window stays open.", flush=True)
     else:
         print("Running. Press F8 to turn capture on.", flush=True)
         print("Press F8 again to turn capture off. This window stays open.", flush=True)
