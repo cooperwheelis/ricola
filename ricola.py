@@ -1,7 +1,9 @@
 """Screenshot a multiple-choice question and show the answer number.
 
-Press F8 to turn capture on, and F8 again to turn it off.
-While it is on, right-click solves the question on that screen.
+On Windows, press F8 to turn capture on, and F8 again to turn it off.
+On macOS, press Control-Option-S. The F8 key is play/pause there, so the
+script never receives it.
+While capture is on, right-click solves the question on that screen.
 The choice number (1, 2, 3, 4, counting from the top) appears as small
 black text at the top center of that monitor.
 
@@ -65,6 +67,18 @@ EFFORT_DEFAULT = "high"
 OVERLAY_FONT = ("Helvetica", 8, "normal") if sys.platform == "darwin" else ("Segoe UI", 8, "normal")
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
+# Hardware keycode for the S key on Apple keyboards. Control-Option-S is used
+# because F8 is the play/pause media key and never arrives as F8.
+MAC_S_KEYCODE = 1
+MODIFIER_KEYS = {
+    keyboard.Key.ctrl: "ctrl",
+    keyboard.Key.ctrl_l: "ctrl",
+    keyboard.Key.ctrl_r: "ctrl",
+    keyboard.Key.alt: "alt",
+    keyboard.Key.alt_l: "alt",
+    keyboard.Key.alt_r: "alt",
+    keyboard.Key.alt_gr: "alt",
+}
 
 SYSTEM_PROMPT = """You answer the multiple-choice question in the main page of a screenshot.
 
@@ -275,6 +289,8 @@ class Ricola:
         self.label.pack()
         configure_overlay(self.root, self.label)
         self.clickthrough_ready = False
+        self._held: set[str] = set()
+        self._toggle_down = False
         self._right_down = None
         self._right_up = None
         self._event_location = None
@@ -286,7 +302,7 @@ class Ricola:
             self._event_location = Quartz.CGEventGetLocation
 
         self.root.after(30, self.poll)
-        keyboard.Listener(on_press=self.on_press).start()
+        keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
         listener_options = {}
         if sys.platform == "win32":
             listener_options["win32_event_filter"] = self.filter_mouse
@@ -296,10 +312,34 @@ class Ricola:
         self.mouse_listener.start()
 
     def on_press(self, key) -> None:
-        if key == keyboard.Key.f8:
-            self.ui.put(("toggle", None))
-        elif key == keyboard.Key.esc and self.armed.is_set():
+        modifier = MODIFIER_KEYS.get(key)
+        if modifier:
+            self._held.add(modifier)
+            return
+        if key == keyboard.Key.f8 or self.mac_toggle(key):
+            if not self._toggle_down:
+                self._toggle_down = True
+                self.ui.put(("toggle", None))
+            return
+        if key == keyboard.Key.esc and self.armed.is_set():
             self.ui.put(("hide", None))
+
+    def on_release(self, key) -> None:
+        modifier = MODIFIER_KEYS.get(key)
+        if modifier:
+            self._held.discard(modifier)
+            return
+        if key == keyboard.Key.f8 or getattr(key, "vk", None) == MAC_S_KEYCODE:
+            self._toggle_down = False
+
+    def mac_toggle(self, key) -> bool:
+        if sys.platform != "darwin":
+            return False
+        if "ctrl" not in self._held or "alt" not in self._held:
+            return False
+        if getattr(key, "vk", None) == MAC_S_KEYCODE:
+            return True
+        return getattr(key, "char", None) in ("s", "S")
 
     def filter_mouse(self, msg, data):
         if not self.armed.is_set() or msg not in (WM_RBUTTONDOWN, WM_RBUTTONUP):
@@ -347,8 +387,10 @@ class Ricola:
         if self.armed.is_set():
             self.armed.clear()
             self.root.withdraw()
+            print("Capture off.", flush=True)
             return
         self.armed.set()
+        print("Capture on. Right-click the question.", flush=True)
 
     def begin(self, x: int, y: int) -> None:
         if not self.armed.is_set():
@@ -542,6 +584,12 @@ def main() -> None:
         run_demo()
         return
     set_console_title("ricola")
+    if sys.platform == "darwin":
+        print("Running. Press Control-Option-S to turn capture on.", flush=True)
+        print("Press it again to turn capture off. This window stays open.", flush=True)
+    else:
+        print("Running. Press F8 to turn capture on.", flush=True)
+        print("Press F8 again to turn capture off. This window stays open.", flush=True)
     Ricola().run()
 
 
