@@ -56,9 +56,13 @@ def enable_dpi_awareness() -> None:
 enable_dpi_awareness()
 
 import mss
-import tkinter as tk
 from anthropic import Anthropic
 from PIL import Image
+
+# Apple's Tk aborts on macOS 15.6 with "macOS 15 (1507) or later required".
+tk = None
+if sys.platform != "darwin":
+    import tkinter as tk
 
 try:
     from pynput import keyboard, mouse
@@ -158,28 +162,10 @@ def claude_key() -> str:
     return key
 
 
-def configure_overlay(root: tk.Tk, label: tk.Label) -> None:
+def configure_overlay(root, label) -> None:
     """Borderless, click-through window. White is the Windows color key."""
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    if sys.platform == "darwin":
-        root.configure(bg="systemTransparent")
-        label.configure(bg="systemTransparent")
-        try:
-            root.attributes("-transparent", True)
-        except tk.TclError:
-            pass
-        try:
-            root.tk.call(
-                "::tk::unsupported::MacWindowStyle",
-                "style",
-                root._w,
-                "help",
-                "noActivates",
-            )
-        except tk.TclError:
-            pass
-        return
     root.configure(bg="white")
     label.configure(bg="white")
     try:
@@ -197,41 +183,84 @@ def set_console_title(title: str) -> None:
         sys.stdout.flush()
 
 
-def _mac_view_is(view, target: int) -> bool:
-    import objc
+class MacAnswer:
+    """Small click-through number. Uses Cocoa because Apple's Tk aborts on 15.6."""
 
-    if view is None:
-        return False
-    if objc.pyobjc_id(view) == target:
-        return True
-    try:
-        children = view.subviews()
-    except Exception:
-        return False
-    return any(_mac_view_is(child, target) for child in children)
+    def __init__(self) -> None:
+        from AppKit import (
+            NSApplication,
+            NSApplicationActivationPolicyAccessory,
+            NSBackingStoreBuffered,
+            NSColor,
+            NSFont,
+            NSMakeRect,
+            NSScreen,
+            NSScreenSaverWindowLevel,
+            NSTextAlignmentCenter,
+            NSTextField,
+            NSWindow,
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowCollectionBehaviorStationary,
+            NSWindowStyleMaskBorderless,
+        )
 
+        self._make_rect = NSMakeRect
+        self._screens = NSScreen
+        app = NSApplication.sharedApplication()
+        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        self.app = app
+        self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, 24, 16),
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.window.setLevel_(NSScreenSaverWindowLevel)
+        self.window.setOpaque_(False)
+        self.window.setBackgroundColor_(NSColor.clearColor())
+        self.window.setIgnoresMouseEvents_(True)
+        self.window.setHasShadow_(False)
+        self.window.setHidesOnDeactivate_(False)
+        self.window.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorStationary
+        )
+        self.label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 24, 16))
+        self.label.setStringValue_("")
+        self.label.setBordered_(False)
+        self.label.setBezeled_(False)
+        self.label.setDrawsBackground_(False)
+        self.label.setEditable_(False)
+        self.label.setSelectable_(False)
+        self.label.setAlignment_(NSTextAlignmentCenter)
+        self.label.setTextColor_(NSColor.blackColor())
+        self.label.setFont_(NSFont.systemFontOfSize_(13))
+        self.window.setContentView_(self.label)
 
-def mac_ns_window(tk_window: tk.Tk):
-    """Find the Cocoa window for a Tk window without casting a raw pointer."""
-    import objc
-    from AppKit import NSApp
+    def hide(self) -> None:
+        self.window.orderOut_(None)
 
-    if NSApp is None:
-        return None
-    target = int(tk_window.winfo_id())
-    windows = list(NSApp.windows())
-    for window in windows:
-        if objc.pyobjc_id(window) == target or _mac_view_is(window.contentView(), target):
-            return window
-    for window in windows:
-        try:
-            if str(window.title()) == tk_window.title():
-                return window
-        except Exception:
-            continue
-    if len(windows) == 1:
-        return windows[0]
-    return None
+    def show(self, text: str, mon: dict | None) -> None:
+        if mon is None:
+            mon = {"left": 0, "top": 0, "width": 0, "height": 0}
+        width = max(18, 11 * max(1, len(text)))
+        height = 18
+        quartz_x, quartz_y = overlay_origin(mon, width, height)
+        screens = self._screens.screens()
+        primary_h = float(screens[0].frame().size.height) if screens else 900.0
+        cocoa_y = primary_h - (quartz_y + height)
+        self.label.setStringValue_(text)
+        self.window.setFrame_display_(self._make_rect(quartz_x, cocoa_y, width, height), True)
+        self.window.orderFrontRegardless()
+
+    def pump(self, poll) -> None:
+        from Foundation import NSTimer
+
+        self._poll = poll
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.03, True, lambda _timer: self._poll())
+        self.app.run()
 
 
 def prepare_macos() -> None:
@@ -275,37 +304,42 @@ class Ricola:
         self.armed = threading.Event()
         self.client: Anthropic | None = None
 
-        self.root = tk.Tk()
-        self.root.title("ricola")
-        self.root.withdraw()
-
-        self.label = tk.Label(
-            self.root,
-            text="",
-            fg="black",
-            bg="white",
-            font=OVERLAY_FONT,
-            padx=2,
-            pady=0,
-            bd=0,
-            highlightthickness=0,
-        )
-        self.label.pack()
-        configure_overlay(self.root, self.label)
+        self.root = None
+        self.label = None
+        self.mac: MacAnswer | None = None
         self.clickthrough_ready = False
         self._toggle_down = False
         self._right_down = None
         self._right_up = None
         self._event_location = None
+        self._key_callback = None
         if sys.platform == "darwin":
             import Quartz
 
+            self.mac = MacAnswer()
             self._right_down = Quartz.kCGEventRightMouseDown
             self._right_up = Quartz.kCGEventRightMouseUp
             self._event_location = Quartz.CGEventGetLocation
-
-        self.root.after(30, self.poll)
-        keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
+            threading.Thread(target=self.listen_keys, daemon=True).start()
+        else:
+            self.root = tk.Tk()
+            self.root.title("ricola")
+            self.root.withdraw()
+            self.label = tk.Label(
+                self.root,
+                text="",
+                fg="black",
+                bg="white",
+                font=OVERLAY_FONT,
+                padx=2,
+                pady=0,
+                bd=0,
+                highlightthickness=0,
+            )
+            self.label.pack()
+            configure_overlay(self.root, self.label)
+            self.root.after(30, self.poll)
+            keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
         listener_options = {}
         if sys.platform == "win32":
             listener_options["win32_event_filter"] = self.filter_mouse
@@ -360,19 +394,26 @@ class Ricola:
                 elif kind == "trigger":
                     self.begin(payload[0], payload[1])
                 elif kind == "hide":
-                    self.root.withdraw()
+                    self.hide_overlay()
                 elif kind == "show":
                     self.show(payload["text"], payload["mon"])
                 elif kind == "idle":
                     self.busy = False
         except queue.Empty:
             pass
-        self.root.after(30, self.poll)
+        if self.root is not None:
+            self.root.after(30, self.poll)
+
+    def hide_overlay(self) -> None:
+        if self.mac is not None:
+            self.mac.hide()
+        elif self.root is not None:
+            self.root.withdraw()
 
     def toggle(self) -> None:
         if self.armed.is_set():
             self.armed.clear()
-            self.root.withdraw()
+            self.hide_overlay()
             print("Capture off.", flush=True)
             return
         self.armed.set()
@@ -384,10 +425,13 @@ class Ricola:
         if self.busy:
             return
         self.busy = True
-        self.root.withdraw()
-        self.root.update_idletasks()
-        # Let the overlay leave the screen before the grab.
-        self.root.after(60, lambda: threading.Thread(target=self.work, args=(x, y), daemon=True).start())
+        self.hide_overlay()
+        if self.root is not None:
+            self.root.update_idletasks()
+            # Let the overlay leave the screen before the grab.
+            self.root.after(60, lambda: threading.Thread(target=self.work, args=(x, y), daemon=True).start())
+            return
+        threading.Timer(0.06, lambda: threading.Thread(target=self.work, args=(x, y), daemon=True).start()).start()
 
     def work(self, x: int, y: int) -> None:
         mon = None
@@ -443,6 +487,9 @@ class Ricola:
     def show(self, text: str, mon: dict | None) -> None:
         if not self.armed.is_set():
             return
+        if self.mac is not None:
+            self.mac.show(text, mon)
+            return
         if mon is None:
             mon = {"left": 0, "top": 0}
         self.label.configure(text=text)
@@ -455,38 +502,55 @@ class Ricola:
         self.root.lift()
         self.apply_overlay_style()
 
-    def apply_overlay_style(self) -> None:
-        if sys.platform == "darwin":
-            self.apply_mac_overlay()
-        elif sys.platform == "win32":
-            self.apply_win_overlay()
-
-    def apply_mac_overlay(self) -> None:
-        self.root.update_idletasks()
+    def listen_keys(self) -> None:
+        """Watch for backslash without the Mac keyboard library that aborts."""
         try:
-            from AppKit import (
-                NSColor,
-                NSScreenSaverWindowLevel,
-                NSWindowCollectionBehaviorCanJoinAllSpaces,
-                NSWindowCollectionBehaviorFullScreenAuxiliary,
-                NSWindowCollectionBehaviorStationary,
+            import Quartz
+            from CoreFoundation import (
+                CFMachPortCreateRunLoopSource,
+                CFRunLoopAddSource,
+                CFRunLoopGetCurrent,
+                CFRunLoopRun,
+                kCFRunLoopDefaultMode,
             )
-        except ImportError:
+        except ImportError as exc:
+            print("Could not load the Mac keyboard library.", flush=True)
+            print(exc, flush=True)
             return
-        window = mac_ns_window(self.root)
-        if window is None:
-            return
-        window.setIgnoresMouseEvents_(True)
-        window.setLevel_(NSScreenSaverWindowLevel)
-        window.setOpaque_(False)
-        window.setHasShadow_(False)
-        window.setHidesOnDeactivate_(False)
-        window.setBackgroundColor_(NSColor.clearColor())
-        window.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-            | NSWindowCollectionBehaviorStationary
+
+        def callback(_proxy, event_type, event, _refcon):
+            try:
+                if event_type == Quartz.kCGEventKeyDown:
+                    repeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
+                    keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                    if not repeat and keycode == MAC_BACKSLASH_KEYCODE:
+                        self.ui.put(("toggle", None))
+                    elif not repeat and keycode == 53 and self.armed.is_set():
+                        self.ui.put(("hide", None))
+            except Exception:
+                pass
+            return event
+
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionListenOnly,
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+            callback,
+            None,
         )
+        self._key_callback = callback
+        if not tap:
+            print("Allow Accessibility for Terminal, then start ricola again.", flush=True)
+            return
+        source = CFMachPortCreateRunLoopSource(None, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode)
+        Quartz.CGEventTapEnable(tap, True)
+        CFRunLoopRun()
+
+    def apply_overlay_style(self) -> None:
+        if sys.platform == "win32":
+            self.apply_win_overlay()
 
     def apply_win_overlay(self) -> None:
         self.root.update_idletasks()
@@ -521,12 +585,21 @@ class Ricola:
         ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0x00FFFFFF, 0, LWA_COLORKEY)
 
     def run(self) -> None:
+        if self.mac is not None:
+            self.mac.pump(self.poll)
+            return
         self.root.mainloop()
 
 
 def run_demo() -> None:
     """Show a sample 2 and save a screenshot, without calling the API."""
     _image, mon = capture(0, 0)
+    if sys.platform == "darwin":
+        mac = MacAnswer()
+        mac.show("2", mon)
+        threading.Timer(8, lambda: mac.app.terminate_(None)).start()
+        mac.pump(lambda: None)
+        return
 
     root = tk.Tk()
     root.title("ricola")
